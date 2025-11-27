@@ -1,3 +1,4 @@
+import os
 import re
 from io import BytesIO
 from typing import Dict, Literal, TypedDict, Optional
@@ -13,28 +14,25 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = "7016777070:AAFlFW1ELdwUP36MV0zCyy43Dlv9iHSz5HI"  
+# ---------------- CONFIG ----------------
 
-# ---------- TYPES / STATE ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"]          # set in Render dashboard
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # auto on Render
+PORT = int(os.environ.get("PORT", "8000"))  # Render injects PORT
 
 class Cover(TypedDict):
     kind: Literal["file_id", "url"]
     value: str
 
-
-# per-user saved cover (used for all upcoming videos)
 cover_store: Dict[int, Cover] = {}
-
-# per-user pending video waiting for a cover
 pending_video: Dict[int, str] = {}
 
 URL_RE = re.compile(r"https?://\S+")
 
 
-# ---------- HELPERS ----------
+# ---------------- HELPERS ----------------
 
 def build_thumb_from_url(url: str) -> InputFile:
-    """Download URL image in memory and convert to valid Telegram thumbnail."""
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     img = Image.open(BytesIO(resp.content)).convert("RGB")
@@ -52,13 +50,13 @@ async def send_video_with_cover(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     if cover["kind"] == "file_id":
-        thumb = cover["value"]  # reuse telegram file
+        thumb = cover["value"]
     else:
         thumb = build_thumb_from_url(cover["value"])
 
     await context.bot.send_video(
         chat_id=chat_id,
-        video=video_file_id,   # same video file_id
+        video=video_file_id,
         thumbnail=thumb,
         supports_streaming=True,
     )
@@ -72,17 +70,16 @@ def get_user_cover(user_id: int) -> Optional[Cover]:
     return cover_store.get(user_id)
 
 
-# ---------- COMMAND HANDLERS ----------
+# ---------------- COMMANDS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Video Cover Bot\n\n"
         "1) Send a cover image (photo or direct image URL).\n"
         "2) Send any video (or forward one).\n"
-        "Bot will re-send that video using your saved cover.\n\n"
-        "Commands:\n"
-        "/show_cover - show current saved cover\n"
-        "/del_cover  - delete saved cover"
+        "Bot will resend it using your saved cover.\n\n"
+        "/show_cover - show current cover\n"
+        "/del_cover  - delete current cover"
     )
     await update.message.reply_text(text)
 
@@ -111,7 +108,7 @@ async def del_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No cover to delete.")
 
 
-# ---------- MESSAGE HANDLERS ----------
+# ---------------- MESSAGE HANDLERS ----------------
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
@@ -119,7 +116,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = msg.chat_id
 
     video = msg.video
-    video_id = video.file_id  # reuse from Telegram
+    video_id = video.file_id
 
     cover = get_user_cover(user_id)
 
@@ -127,7 +124,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await msg.reply_text("Applying saved cover…")
         await send_video_with_cover(chat_id, video_id, cover, context)
     else:
-        # wait for a cover for this video
         pending_video[user_id] = video_id
         await msg.reply_text("Video received. Send cover image (photo or direct image URL).")
 
@@ -137,7 +133,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = msg.from_user.id
     chat_id = msg.chat_id
 
-    # largest size
     photo = msg.photo[-1]
     file_id = photo.file_id
 
@@ -159,7 +154,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     m = URL_RE.search(text)
     if not m:
-        # ignore normal text
         return
 
     url = m.group(0)
@@ -173,20 +167,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text("Cover URL saved. It will be used for your next videos.")
 
 
-# ---------- MAIN ----------
+# ---------------- MAIN / WEBHOOK ----------------
 
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("show_cover", show_cover))
-    app.add_handler(CommandHandler("del_cover", del_cover))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("show_cover", show_cover))
+    application.add_handler(CommandHandler("del_cover", del_cover))
 
-    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if RENDER_EXTERNAL_URL:
+        # Webhook mode for Render Web Service
+        webhook_path = BOT_TOKEN  # URL path segment
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=webhook_path,
+            webhook_url=f"{RENDER_EXTERNAL_URL}/{webhook_path}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Fallback for local testing
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
