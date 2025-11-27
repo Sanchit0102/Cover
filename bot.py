@@ -1,11 +1,8 @@
 import os
 import re
-from io import BytesIO
 from typing import Dict, Literal, TypedDict, Optional
 
-import requests
-from PIL import Image
-from telegram import Update, InputFile
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -16,49 +13,47 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]          # set in Render dashboard
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # auto on Render
-PORT = int(os.environ.get("PORT", "8000"))  # Render injects PORT
+BOT_TOKEN = os.environ["BOT_TOKEN"]          # set in Render env
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+PORT = int(os.environ.get("PORT", "8000"))   # Render injects PORT
+
+
+# ---------------- STATE ----------------
 
 class Cover(TypedDict):
     kind: Literal["file_id", "url"]
     value: str
 
-cover_store: Dict[int, Cover] = {}
-pending_video: Dict[int, str] = {}
+
+class PendingVideo(TypedDict):
+    video_id: str
+    caption: Optional[str]
+
+
+cover_store: Dict[int, Cover] = {}          # user_id -> Cover
+pending_video: Dict[int, PendingVideo] = {}  # user_id -> PendingVideo
 
 URL_RE = re.compile(r"https?://\S+")
 
 
 # ---------------- HELPERS ----------------
 
-def build_thumb_from_url(url: str) -> InputFile:
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
-    img = Image.open(BytesIO(resp.content)).convert("RGB")
-    img.thumbnail((320, 320))
-    bio = BytesIO()
-    img.save(bio, format="JPEG", quality=85, optimize=True)
-    bio.seek(0)
-    return InputFile(bio, filename="thumb.jpg")
-
-
 async def send_video_with_cover(
     chat_id: int,
     video_file_id: str,
     cover: Cover,
+    caption: Optional[str],
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    if cover["kind"] == "file_id":
-        thumb = cover["value"]
-    else:
-        thumb = build_thumb_from_url(cover["value"])
+    # Bot API 8.3: use "cover" parameter; must be passed via api_kwargs in PTB
+    cover_value = cover["value"]
 
     await context.bot.send_video(
         chat_id=chat_id,
         video=video_file_id,
-        thumbnail=thumb,
+        caption=caption,
         supports_streaming=True,
+        api_kwargs={"cover": cover_value},
     )
 
 
@@ -76,10 +71,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Video Cover Bot\n\n"
         "1) Send a cover image (photo or direct image URL).\n"
-        "2) Send any video (or forward one).\n"
-        "Bot will resend it using your saved cover.\n\n"
-        "/show_cover - show current cover\n"
-        "/del_cover  - delete current cover"
+        "2) Send or forward any video.\n"
+        "Bot will resend it using your saved cover and same caption.\n\n"
+        "Commands:\n"
+        "/show_cover - show current saved cover\n"
+        "/del_cover  - delete saved cover"
     )
     await update.message.reply_text(text)
 
@@ -93,10 +89,7 @@ async def show_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No cover saved.")
         return
 
-    if cover["kind"] == "file_id":
-        await context.bot.send_photo(chat_id=chat_id, photo=cover["value"], caption="Saved cover")
-    else:
-        await context.bot.send_photo(chat_id=chat_id, photo=cover["value"], caption="Saved cover (URL)")
+    await context.bot.send_photo(chat_id=chat_id, photo=cover["value"], caption="Saved cover")
 
 
 async def del_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -117,14 +110,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     video = msg.video
     video_id = video.file_id
+    caption = msg.caption_html or msg.caption  # keep caption (works for forwarded too)
 
     cover = get_user_cover(user_id)
 
     if cover:
         await msg.reply_text("Applying saved cover…")
-        await send_video_with_cover(chat_id, video_id, cover, context)
+        await send_video_with_cover(chat_id, video_id, cover, caption, context)
     else:
-        pending_video[user_id] = video_id
+        # store video until user sends cover
+        pending_video[user_id] = {"video_id": video_id, "caption": caption}
         await msg.reply_text("Video received. Send cover image (photo or direct image URL).")
 
 
@@ -139,9 +134,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     set_user_cover(user_id, {"kind": "file_id", "value": file_id})
 
     if user_id in pending_video:
-        video_id = pending_video.pop(user_id)
+        pv = pending_video.pop(user_id)
         await msg.reply_text("Cover saved. Processing pending video…")
-        await send_video_with_cover(chat_id, video_id, cover_store[user_id], context)
+        await send_video_with_cover(
+            chat_id,
+            pv["video_id"],
+            cover_store[user_id],
+            pv["caption"],
+            context,
+        )
     else:
         await msg.reply_text("Cover saved. It will be used for your next videos.")
 
@@ -160,9 +161,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     set_user_cover(user_id, {"kind": "url", "value": url})
 
     if user_id in pending_video:
-        video_id = pending_video.pop(user_id)
+        pv = pending_video.pop(user_id)
         await msg.reply_text("Cover URL saved. Processing pending video…")
-        await send_video_with_cover(chat_id, video_id, cover_store[user_id], context)
+        await send_video_with_cover(
+            chat_id,
+            pv["video_id"],
+            cover_store[user_id],
+            pv["caption"],
+            context,
+        )
     else:
         await msg.reply_text("Cover URL saved. It will be used for your next videos.")
 
@@ -181,18 +188,15 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if RENDER_EXTERNAL_URL:
-        # Webhook mode for Render Web Service
-        webhook_path = BOT_TOKEN  # URL path segment
+        path = BOT_TOKEN  # webhook path segment
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=webhook_path,
-            webhook_url=f"{RENDER_EXTERNAL_URL}/{webhook_path}",
-            allowed_updates=Update.ALL_TYPES,
+            url_path=path,
+            webhook_url=f"{RENDER_EXTERNAL_URL}/{path}",
         )
     else:
-        # Fallback for local testing
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        application.run_polling()
 
 
 if __name__ == "__main__":
