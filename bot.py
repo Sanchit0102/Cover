@@ -20,13 +20,13 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 
-BOT_TOKEN = "7550567872:AAHZkwPw_QnFF2eOv5YOtL3mARMmlGbtlE0"
+BOT_TOKEN = ""
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", "8000"))
 URL_RE = re.compile(r"https?://\S+")
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb+srv://database2:database2@cluster0.p4ztr4z.mongodb.net/?appName=Cluster0",
+    "",
 )
 
 # ---------------- DB ----------------
