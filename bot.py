@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, Literal, TypedDict, Optional
+from typing import Literal, TypedDict, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone
 
@@ -20,21 +20,20 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 
-BOT_TOKEN = "7550567872:AAHZkwPw_QnFF2eOv5YOtL3mARMmlGbtlE0" # os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", "8000"))
+MONGO_URI = os.environ.get("MONGO_URI", "")
+
 URL_RE = re.compile(r"https?://\S+|www\.\S+")
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://database2:database2@cluster0.p4ztr4z.mongodb.net/?appName=Cluster0")
+MENTION_RE = re.compile(r"@\w+")
 
 mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["poster_change"]
 users_col = db.users
 pending_col = db.pending_videos
 
-# ---------------- DB HELPER ----------------
-
-def remove_links(text: str) -> str:
-    return URL_RE.sub("", text).strip()
+# ---------------- DB HELPERS ----------------
 
 async def upsert_user(user):
     await users_col.update_one(
@@ -47,23 +46,34 @@ async def upsert_user(user):
             "$setOnInsert": {
                 "created_at": datetime.now(timezone.utc),
                 "caption_style": "normal",
-                "url_remover": False,
+                "url_filter": "off",
+                "waiting_for_cover": False,
             },
         },
         upsert=True,
     )
 
-async def set_url_remover(user_id: int, value: bool):
+async def set_url_filter(user_id: int, mode: str):
     await users_col.update_one(
         {"_id": user_id},
-        {"$set": {"url_remover": value}},
+        {"$set": {"url_filter": mode}},
         upsert=True,
     )
 
-async def get_url_remover(user_id: int) -> bool:
+async def get_url_filter(user_id: int) -> str:
     u = await users_col.find_one({"_id": user_id})
-    return u.get("url_remover", False) if u else False
+    return u.get("url_filter", "off") if u else "off"
 
+async def is_waiting_for_cover(user_id: int) -> bool:
+    u = await users_col.find_one({"_id": user_id})
+    return u.get("waiting_for_cover", False) if u else False
+
+async def set_waiting_for_cover(user_id: int, value: bool):
+    await users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"waiting_for_cover": value}},
+        upsert=True,
+    )
 
 async def set_caption_style(user_id: int, style: str):
     await users_col.update_one(
@@ -71,11 +81,9 @@ async def set_caption_style(user_id: int, style: str):
         {"$set": {"caption_style": style}},
     )
 
-
 async def get_caption_style(user_id: int) -> str:
     u = await users_col.find_one({"_id": user_id})
     return u.get("caption_style", "normal") if u else "normal"
-
 
 async def set_user_cover(user_id: int, cover: dict):
     await users_col.update_one(
@@ -84,18 +92,15 @@ async def set_user_cover(user_id: int, cover: dict):
         upsert=True,
     )
 
-
 async def get_user_cover(user_id: int):
     u = await users_col.find_one({"_id": user_id})
     return u.get("cover") if u else None
-
 
 async def delete_user_cover(user_id: int):
     await users_col.update_one(
         {"_id": user_id},
         {"$unset": {"cover": ""}},
     )
-
 
 async def add_pending_video(user_id, chat_id, video_id, caption):
     await pending_col.insert_one({
@@ -106,11 +111,19 @@ async def add_pending_video(user_id, chat_id, video_id, caption):
         "created_at": datetime.now(timezone.utc),
     })
 
-
 async def get_pending_videos(user_id):
     cursor = pending_col.find({"user_id": user_id}).sort("created_at", 1)
     return [doc async for doc in cursor]
 
+# ---------------- SANITIZER ----------------
+
+def sanitize_caption(text: str, mode: str) -> str:
+    if mode == "url":
+        text = URL_RE.sub("", text)
+    elif mode == "url_mention":
+        text = URL_RE.sub("", text)
+        text = MENTION_RE.sub("", text)
+    return text.strip()
 
 # ---------------- STATE ----------------
 
@@ -134,8 +147,10 @@ STYLE_WRAPPER = {
 HOME_BUTTON = InlineKeyboardMarkup(
     [
         [
+            InlineKeyboardButton("URL & Mention Remover 🔗", callback_data="open_url_remover"),
+        ],
+        [
             InlineKeyboardButton("Caption Font 📝", callback_data="open_style_menu"),
-            InlineKeyboardButton("URL Remover 🔗", callback_data="open_url_remover"),
         ],
         [
             InlineKeyboardButton("Developer 👨🏻‍💻", url="https://t.me/THE_DS_OFFICIAL")
@@ -143,13 +158,32 @@ HOME_BUTTON = InlineKeyboardMarkup(
     ]
 )
 
-BACK_BTN = InlineKeyboardMarkup(
-    [
+def url_filter_menu(selected: str):
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("⇽ Back To Caption Style", callback_data="back_caption")
-         ]
-    ]
-) 
+            [
+                InlineKeyboardButton(
+                    f"Remove URLs Only {'✅' if selected == 'url' else ''}",
+                    callback_data="filter:url",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Remove URL + Mention {'✅' if selected == 'url_mention' else ''}",
+                    callback_data="filter:url_mention",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Disable / OFF {'✅' if selected == 'off' else ''}",
+                    callback_data="filter:off",
+                ),
+            ],
+            [
+                InlineKeyboardButton("⇽ Back To Home", callback_data="back_home")
+            ],
+        ]
+    )
 
 STYLE_MENU = InlineKeyboardMarkup(
     [
@@ -175,28 +209,14 @@ STYLE_MENU = InlineKeyboardMarkup(
     ]
 )
 
-def url_remover_menu(enabled: bool):
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"ON {'✅' if enabled else ''}",
-                    callback_data="url:on",
-                ),
-                InlineKeyboardButton(
-                    f"OFF {'✅' if not enabled else ''}",
-                    callback_data="url:off",
-                ),
-            ],
-            [
-                InlineKeyboardButton("⇽ Back To Home", callback_data="back_home")
-            ],
-        ]
-    )
+
+BACK_BTN = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("⇽ Back To Caption Style", callback_data="back_caption")]]
+)
 
 # ---------------- TEXTS ----------------
 START_TEXT = (
-    "<b>Hello, I'm Auto Video Thumbnail Change Bot</b>\n\n"
+    "<b>Hello, I'm Auto Video Thumbnail Changer Bot</b>\n\n"
     "<b>📌 How To Use:</b>\n"
     "1) Send a photo or direct URL.\n"
     "2) Send or forward any video.\n\n"
@@ -206,17 +226,10 @@ START_TEXT = (
     )
 # ---------------- HELPERS ----------------
 
-async def send_video_with_cover(
-    chat_id: int,
-    video_file_id: str,
-    cover: Cover,
-    caption: Optional[str],
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    
+async def send_video_with_cover(chat_id, video_id, cover, caption, context):
     await context.bot.send_video(
         chat_id=chat_id,
-        video=video_file_id,
+        video=video_id,
         caption=caption,
         supports_streaming=True,
         parse_mode="HTML",
@@ -225,74 +238,72 @@ async def send_video_with_cover(
 
 # ---------------- COMMANDS ----------------
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        START_TEXT, 
-        reply_markup=HOME_BUTTON,
-        parse_mode="HTML"
-        )
+        START_TEXT, reply_markup=HOME_BUTTON, parse_mode="HTML"
+    )
 
 # ---------------- CALLBACKS ----------------
 
-async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user
     user_id = query.from_user.id
-
-    await upsert_user(user)
-    
+    await upsert_user(query.from_user)
     await query.answer()
 
     if query.data == "back_home":
         await query.message.edit_text(
-            START_TEXT,
-            reply_markup=HOME_BUTTON,
-            parse_mode="HTML"
+            START_TEXT, reply_markup=HOME_BUTTON, parse_mode="HTML"
         )
         return
 
     if query.data == "open_url_remover":
-        enabled = await get_url_remover(user_id)
+        mode = await get_url_filter(user_id)
         await query.message.edit_text(
-            "<b>🔗 Set URL Remover</b>",
-            reply_markup=url_remover_menu(enabled),
-            parse_mode="HTML",
-        )
-        return
-    
-    if query.data in ("open_style_menu", "back_caption"):
-        await query.message.edit_text(
-            "<b>✍🏻 Select Caption Style</b>",
-            reply_markup=STYLE_MENU,
+            "<b>🔗 URL & Mention Filter</b>",
+            reply_markup=url_filter_menu(mode),
             parse_mode="HTML",
         )
         return
 
-    if query.data.startswith("url:"):
-        value = query.data.split(":")[1] == "on"
-        await set_url_remover(user_id, value)
+    if query.data.startswith("filter:"):
+        mode = query.data.split(":")[1]
+        await set_url_filter(user_id, mode)
 
-        enabled = value
         await query.answer(
-            f"URL Remover {'ON ✅' if enabled else 'OFF ✅'}",
+            {
+                "url": "Remove URLs Only ✅",
+                "url_mention": "Remove URL + Mention ✅",
+                "off": "Disabled / OFF ✅",
+            }[mode],
             show_alert=True,
         )
 
         await query.message.edit_reply_markup(
-            reply_markup=url_remover_menu(enabled)
+            reply_markup=url_filter_menu(mode)
+        )
+        return
+
+    if query.data in ("open_style_menu", "back_caption"):
+        style = await get_caption_style(user_id)
+        await query.message.edit_text(
+            "<b>✍🏻 Select Caption Style ✍🏻</b>\n\n"
+            "<b>📝 Current Style:</b> <code>{}</code>".format(style.upper()),
+            reply_markup=STYLE_MENU,
+            parse_mode="HTML",
         )
         return
 
     if query.data.startswith("style:"):
         style = query.data.split(":")[1]
         await set_caption_style(user_id, style)
-        
         await query.message.edit_text(
             f"✅ Caption style set to <b>{style.upper()}</b>\n\nnow you send your video 🎬", 
             reply_markup=BACK_BTN,
-            parse_mode="HTML"
-            )
+            parse_mode="HTML",
+        )
 
+# ---------------- MESSAGE HANDLERS ----------------
 
 async def show_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -316,45 +327,45 @@ async def del_cover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Cover deleted.")
 
 
-# ---------------- MESSAGE HANDLERS ----------------
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    user = msg.from_user
     user_id = msg.from_user.id
-    chat_id = msg.chat_id
-    await upsert_user(user)
+    await upsert_user(msg.from_user)
 
-    video_id = msg.video.file_id
-    style = await get_caption_style(user_id)
     raw = msg.caption_html or msg.caption or ""
+    style = await get_caption_style(user_id)
+    mode = await get_url_filter(user_id)
 
-    if await get_url_remover(user_id):
-        raw = remove_links(raw)
-
+    raw = sanitize_caption(raw, mode)
     caption = STYLE_WRAPPER[style].format(raw)
+
     cover = await get_user_cover(user_id)
 
     if cover:
-        await send_video_with_cover(chat_id, video_id, cover, caption, context)
+        await send_video_with_cover(
+            msg.chat_id, msg.video.file_id, cover, caption, context
+        )
     else:
-        await add_pending_video(user_id, chat_id, video_id, caption)
-        await msg.reply_text("Video received. Send cover image (photo or direct image URL).")
+        await add_pending_video(
+            user_id, msg.chat_id, msg.video.file_id, caption
+        )
+        if not await is_waiting_for_cover(user_id):
+            await msg.reply_text(
+                "Video received. Send cover image (photo or direct image URL)."
+            )
+            await set_waiting_for_cover(user_id, True)
 
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    user = msg.from_user
     user_id = msg.from_user.id
+    await upsert_user(msg.from_user)
 
-    await upsert_user(user)
-
-    file_id = msg.photo[-1].file_id
-    cover = {"kind": "file_id", "value": file_id}
+    cover = {"kind": "file_id", "value": msg.photo[-1].file_id}
     await set_user_cover(user_id, cover)
+    await set_waiting_for_cover(user_id, False)
 
     pending = await get_pending_videos(user_id)
-    
+
     if not pending:
         await msg.reply_text("Cover Saved. It will be used for your next videos.")
         return
@@ -363,19 +374,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     for pv in pending:
         await send_video_with_cover(
-            pv["chat_id"],
-            pv["video_id"],
-            cover,
-            pv["caption"],
-            context,
+            pv["chat_id"], pv["video_id"], cover, pv["caption"], context
         )
-        pending_col.delete_one({"_id": pv["_id"]})   
+        await pending_col.delete_one({"_id": pv["_id"]})
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    user = msg.from_user
     user_id = msg.from_user.id
-    await upsert_user(user)
+    await upsert_user(msg.from_user)
 
     m = URL_RE.search(msg.text or "")
     if not m:
@@ -383,6 +389,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     cover = {"kind": "url", "value": m.group(0)}
     await set_user_cover(user_id, cover)
+    await set_waiting_for_cover(user_id, False)
+
     pending = await get_pending_videos(user_id)
 
     if not pending:
@@ -393,40 +401,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     for pv in pending:
         await send_video_with_cover(
-            pv["chat_id"],
-            pv["video_id"],
-            cover,
-            pv["caption"],
-            context,
+            pv["chat_id"], pv["video_id"], cover, pv["caption"], context
         )
-        pending_col.delete_one({"_id": pv["_id"]})   
-
+        await pending_col.delete_one({"_id": pv["_id"]})
 
 # ---------------- MAIN ----------------
 
-def main() -> None:
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("show_cover", show_cover))
-    application.add_handler(CommandHandler("del_cover", del_cover))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("show_cover", show_cover))
+    app.add_handler(CommandHandler("del_cover", del_cover))
 
-    application.add_handler(CallbackQueryHandler(style_callback))
-    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(style_callback))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if RENDER_EXTERNAL_URL:
-        path = BOT_TOKEN
-        application.run_webhook(
+        app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=path,
-            webhook_url=f"{RENDER_EXTERNAL_URL}/{path}",
+            url_path="webhook",
+            webhook_url=f"{RENDER_EXTERNAL_URL}/webhook",
         )
     else:
-        application.run_polling()
-
+        app.run_polling()
 
 if __name__ == "__main__":
     main()
